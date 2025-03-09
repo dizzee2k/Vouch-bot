@@ -26,7 +26,7 @@ const OUTPUT_CHANNEL_ID = '1344063202643673128'; // Output channel (#vouch-check
 const GUILD_ID = '1242348592547496046'; // Hardcoded guild ID
 const ROLE_TIER_DATA = [
     { roleId: '1339056153170284576', vouches: 3 },
-    { roleId: '1339056251090243654', vouches: 7 },
+    { roleId: '1339056251090243654', vouches: 5 },
     { roleId: '1339056315904954471', vouches: 30 }
 ];
 
