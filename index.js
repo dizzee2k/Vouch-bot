@@ -20,8 +20,8 @@ app.listen(PORT, () => {
     console.log(`Express server running on port ${PORT}`);
 });
 
-const DEFAULT_VOUCH_CHANNEL_NAME = 'vouch';
-const VOUCH_CHANNEL_ID = '1306602749621698560';
+const DEFAULT_VOUCH_CHANNEL_NAME = 'vouch-check-command-center';
+const VOUCH_CHANNEL_ID = '1344063202643673128';
 const ROLE_TIER_DATA = [
     { roleId: '1339056153170284576', vouches: 3 }, // Verify and update these IDs
     { roleId: '1339056251090243654', vouches: 15 },
