@@ -1,0 +1,506 @@
+require('web-streams-polyfill');
+require('dotenv').config();
+const { Client, IntentsBitField, PermissionsBitField } = require('discord.js');
+const fs = require('fs');
+const express = require('express');
+
+const client = new Client({
+    intents: [
+        IntentsBitField.Flags.Guilds,
+        IntentsBitField.Flags.GuildMembers,
+        IntentsBitField.Flags.GuildMessages,
+        IntentsBitField.Flags.MessageContent
+    ]
+});
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+app.get('/', (req, res) => res.send('Vouch Bot is running!'));
+app.listen(PORT, () => {
+    console.log(`Express server running on port ${PORT}`);
+});
+
+const PREFIX = '/';
+const DEFAULT_VOUCH_CHANNEL_NAME = 'vouch';
+const VOUCH_CHANNEL_ID = '1306602749621698560'; // Channel to search for vouches
+const OUTPUT_CHANNEL_ID = '1344063202643673128'; // Channel to send output messages (#vouch-check-command-center)
+const ROLE_TIER_DATA = [
+    { roleId: '1339056153170284576', vouches: 3 },
+    { roleId: '1339056251090243654', vouches: 7 },
+    { roleId: '1339056315904954471', vouches: 30 }
+];
+
+const MOD_ROLE_ID = '1306596690903437323';
+const OWNER_ROLE_ID = '1306596817588191274';
+
+function loadVouchData() {
+    try {
+        const data = fs.readFileSync('vouchData.json', 'utf8');
+        const parsedData = JSON.parse(data);
+        console.log('Loaded vouch data:', parsedData);
+        return new Map(parsedData);
+    } catch (error) {
+        console.log('No vouch data found, starting fresh:', error.message);
+        return new Map();
+    }
+}
+
+function saveVouchData(vouchCounts) {
+    try {
+        const dataToSave = [...vouchCounts];
+        fs.writeFileSync('vouchData.json', JSON.stringify(dataToSave));
+        console.log('Saved vouch data:', dataToSave);
+    } catch (error) {
+        console.error('Error saving vouch data:', error.message);
+    }
+}
+
+function logError(message) {
+    console.error(message);
+    fs.appendFileSync('error.log', `${new Date().toISOString()} - ${message}\n`);
+}
+
+// Updated getOutputChannel to handle guild mismatch and fall back to command channel
+async function getOutputChannel(guild, commandChannel = null) {
+    try {
+        const outputChannel = await client.channels.fetch(OUTPUT_CHANNEL_ID).catch(error => {
+            logError(`Failed to fetch output channel ${OUTPUT_CHANNEL_ID}: ${error.message}`);
+            return null;
+        });
+
+        if (!outputChannel || !outputChannel.isTextBased()) {
+            throw new Error(`Output channel ${OUTPUT_CHANNEL_ID} is not a text channel or not found.`);
+        }
+
+        // Verify the channel belongs to the guild
+        if (outputChannel.guild.id !== guild.id) {
+            throw new Error(`Output channel ${OUTPUT_CHANNEL_ID} does not belong to guild ${guild.id}.`);
+        }
+
+        const botMember = guild.members.me;
+        const requiredPermissions = [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages
+        ];
+        const channelPermissions = botMember.permissionsIn(outputChannel);
+        const missingPermissions = requiredPermissions.filter(perm => !channelPermissions.has(perm));
+        if (missingPermissions.length > 0) {
+            const missingPermNames = missingPermissions.map(perm => {
+                for (const [key, value] of Object.entries(PermissionsBitField.Flags)) {
+                    if (value === perm) return key;
+                }
+                return perm;
+            });
+            throw new Error(`Bot lacks permissions in output channel ${outputChannel.name}: ${missingPermNames.join(', ')}.`);
+        }
+
+        console.log(`Output channel set to: ${outputChannel.name} (ID: ${outputChannel.id})`);
+        return outputChannel;
+    } catch (error) {
+        logError(`Error setting output channel: ${error.message}`);
+        if (commandChannel) {
+            await commandChannel.send(`Could not use output channel <#${OUTPUT_CHANNEL_ID}>: ${error.message}. Falling back to command channel for responses.`);
+        }
+        return commandChannel || null; // Fall back to command channel if provided, otherwise null
+    }
+}
+
+async function findChannel(guild, channelMentionOrName) {
+    if (!guild) throw new Error('Guild not found. Ensure the bot is in the correct server.');
+    console.log(`Searching for channel: ${channelMentionOrName || 'default vouch channel'}`);
+
+    let channel = null;
+    if (channelMentionOrName && channelMentionOrName.match(/<#(\d+)>/)) {
+        const channelId = channelMentionOrName.match(/<#(\d+)>/)[1];
+        channel = await client.channels.fetch(channelId).catch(error => {
+            logError(`Failed to fetch channel by ID ${channelId}: ${error.message}`);
+            return null;
+        });
+    } else if (VOUCH_CHANNEL_ID) {
+        channel = await client.channels.fetch(VOUCH_CHANNEL_ID).catch(error => {
+            logError(`Failed to fetch default channel by ID ${VOUCH_CHANNEL_ID}: ${error.message}`);
+            return null;
+        });
+    }
+
+    if (channel && channel.isTextBased()) {
+        console.log(`Found channel by ID: ${channel.name} (ID: ${channel.id})`);
+        return channel;
+    }
+
+    if (channelMentionOrName) {
+        const cleanChannelName = channelMentionOrName.replace(/^#/, '').toLowerCase();
+        channel = guild.channels.cache.find(c => c.name.toLowerCase() === cleanChannelName && c.isTextBased());
+        if (channel) {
+            console.log(`Found channel by name: ${channel.name} (ID: ${channel.id})`);
+            return channel;
+        }
+    }
+
+    channel = guild.channels.cache.find(c => c.name.toLowerCase() === DEFAULT_VOUCH_CHANNEL_NAME && c.isTextBased());
+    if (channel) {
+        console.log(`Falling back to default vouch channel: ${channel.name} (ID: ${channel.id})`);
+        return channel;
+    }
+
+    const textChannels = guild.channels.cache.filter(c => c.isTextBased());
+    console.log('Available text channels in guild:', textChannels.map(c => `${c.name} (ID: ${c.id})`).join(', '));
+    throw new Error(`Could not find channel '${channelMentionOrName || DEFAULT_VOUCH_CHANNEL_NAME}'. Ensure the channel exists, is text-based, and the bot has access.`);
+}
+
+async function processMentionsInChannel(searchChannel, guild, targetUserId = null, commandChannel = null) {
+    let outputChannel;
+    try {
+        outputChannel = await getOutputChannel(guild, commandChannel); // Pass commandChannel as fallback
+        if (!outputChannel) {
+            throw new Error('No valid output channel available.');
+        }
+    } catch (error) {
+        logError(`Cannot proceed without output channel: ${error.message}`);
+        return; // Exit if no output channel is available
+    }
+
+    try {
+        if (!searchChannel || !searchChannel.isTextBased()) {
+            throw new Error(`Search channel is not defined or not text-based. Ensure ${searchChannel?.id || 'unknown'} is a text channel.`);
+        }
+
+        const botMember = guild.members.me;
+        const requiredPermissions = [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.ReadMessageHistory,
+            PermissionsBitField.Flags.SendMessages
+        ];
+        const channelPermissions = botMember.permissionsIn(searchChannel);
+        const missingPermissions = requiredPermissions.filter(perm => !channelPermissions.has(perm));
+        if (missingPermissions.length > 0) {
+            const missingPermNames = missingPermissions.map(perm => {
+                for (const [key, value] of Object.entries(PermissionsBitField.Flags)) {
+                    if (value === perm) return key;
+                }
+                return perm;
+            });
+            console.log(`Bot lacks permissions in channel ${searchChannel.id}: Missing ${missingPermNames.join(', ')}`);
+            throw new Error(`Bot lacks the following permissions in search channel ${searchChannel.name}: ${missingPermNames.join(', ')}.`);
+        }
+        console.log(`Bot has required permissions in search channel ${searchChannel.id}: ViewChannel, ReadMessageHistory, SendMessages`);
+
+        console.log(`Attempting to fetch messages from search channel ${searchChannel.id} (Name: ${searchChannel.name})`);
+
+        let members;
+        try {
+            console.log(`Attempting to fetch members for guild ${guild.id} with ${guild.memberCount} members`);
+            members = await guild.members.fetch();
+            console.log(`Successfully fetched ${members.size} members`);
+        } catch (error) {
+            logError(`Failed to fetch guild members: ${error.message}`);
+            members = guild.members.cache;
+            console.log(`Falling back to cached members. Total cached members: ${members.size}`);
+        }
+        const memberIds = new Set(members.keys());
+
+        let messages = new Map();
+        let lastId = null;
+        let totalMessages = 0;
+        const maxMessages = 1000;
+
+        while (totalMessages < maxMessages) {
+            const fetchOptions = { limit: 100 };
+            if (lastId) fetchOptions.before = lastId;
+
+            const newMessages = await searchChannel.messages.fetch(fetchOptions).catch(error => {
+                logError(`Failed to fetch messages: ${error.message}`);
+                throw new Error(`Failed to fetch messages: ${error.message}`);
+            });
+
+            if (newMessages.size === 0) break;
+
+            newMessages.forEach(msg => messages.set(msg.id, msg));
+            totalMessages += newMessages.size;
+            lastId = newMessages.last()?.id;
+
+            console.log(`Fetched ${newMessages.size} messages, total: ${totalMessages}`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+
+        console.log(`Fetched ${totalMessages} messages in search channel ${searchChannel.id}`);
+        await outputChannel.send(`Fetched ${totalMessages} messages in channel ${searchChannel.name} for vouch search.`);
+
+        let mentionCount = 0;
+
+        messages.forEach(message => {
+            if (message.author.bot || message.content.startsWith(PREFIX)) return;
+
+            const mentions = new Set();
+            message.mentions.users.forEach(user => mentions.add(user.id));
+
+            const rawMentions = message.content.match(/<@!?(\d+)>/g);
+            if (rawMentions) {
+                rawMentions.forEach(mention => {
+                    const userId = mention.match(/<@!?(\d+)>/)[1];
+                    mentions.add(userId);
+                });
+            }
+
+            mentions.forEach(userId => {
+                if (memberIds.has(userId)) {
+                    if (!targetUserId || userId === targetUserId) {
+                        const currentCount = vouchCounts.get(userId) || 0;
+                        if (currentCount < 50) {
+                            vouchCounts.set(userId, currentCount + 1);
+                            mentionCount++;
+                            console.log(`Counted mention for user ${userId} in message ${message.id}`);
+                        }
+                    }
+                }
+            });
+        });
+
+        if (mentionCount > 0) {
+            console.log(`Found ${mentionCount} unique explicit @mentions in search channel ${searchChannel.id} for ${targetUserId ? 'target user' : 'all server members'}`);
+            await outputChannel.send(`Found ${mentionCount} unique explicit @mentions in channel ${searchChannel.name} for ${targetUserId ? `<@${targetUserId}>` : 'all server members'}.`);
+        } else {
+            console.log(`No explicit @mentions found in search channel ${searchChannel.id} for ${targetUserId ? 'target user' : 'all server members'}`);
+            await outputChannel.send(`No explicit @mentions found in channel ${searchChannel.name} for ${targetUserId ? `<@${targetUserId}>` : 'all server members'}.`);
+        }
+
+        if (targetUserId) {
+            const member = guild.members.cache.get(targetUserId) || await guild.members.fetch(targetUserId).catch(() => null);
+            if (member) {
+                const count = vouchCounts.get(targetUserId) || 0;
+                const currentRoles = ROLE_TIER_DATA.map(t => t.roleId).filter(id => member.roles.cache.has(id));
+                const highestThreshold = ROLE_TIER_DATA.filter(t => count >= t.vouches).pop();
+
+                if (highestThreshold) {
+                    for (const oldRoleId of currentRoles) {
+                        if (oldRoleId !== highestThreshold.roleId && member.roles.cache.has(oldRoleId)) {
+                            await member.roles.remove(oldRoleId).catch(error => logError(`Failed to remove role ${oldRoleId}: ${error.message}`));
+                            await new Promise(resolve => setTimeout(resolve, 500));
+                        }
+                    }
+                    if (!member.roles.cache.has(highestThreshold.roleId)) {
+                        await member.roles.add(highestThreshold.roleId).catch(error => logError(`Failed to add role ${highestThreshold.roleId}: ${error.message}`));
+                        await outputChannel.send(`${member.user.tag} now has ${count} vouch${count === 1 ? '' : 'es'} and earned the <@&${highestThreshold.roleId}> role!`);
+                    } else {
+                        await outputChannel.send(`${member.user.tag} now has ${count} vouch${count === 1 ? '' : 'es'}.`);
+                    }
+                } else {
+                    for (const role of ROLE_TIER_DATA) {
+                        if (member.roles.cache.has(role.roleId)) {
+                            await member.roles.remove(role.roleId).catch(error => logError(`Failed to remove role ${role.roleId}: ${error.message}`));
+                            await new Promise(resolve => setTimeout(resolve, 500));
+                        }
+                    }
+                }
+            }
+        } else {
+            for (const [userId, count] of vouchCounts) {
+                const member = guild.members.cache.get(userId) || await guild.members.fetch(userId).catch(() => null);
+                if (member) {
+                    const currentRoles = ROLE_TIER_DATA.map(t => t.roleId).filter(id => member.roles.cache.has(id));
+                    const highestThreshold = ROLE_TIER_DATA.filter(t => count >= t.vouches).pop();
+
+                    if (highestThreshold) {
+                        for (const oldRoleId of currentRoles) {
+                            if (oldRoleId !== highestThreshold.roleId && member.roles.cache.has(oldRoleId)) {
+                                await member.roles.remove(oldRoleId).catch(error => logError(`Failed to remove role ${oldRoleId}: ${error.message}`));
+                                await new Promise(resolve => setTimeout(resolve, 500));
+                            }
+                        }
+                        if (!member.roles.cache.has(highestThreshold.roleId)) {
+                            await member.roles.add(highestThreshold.roleId).catch(error => logError(`Failed to add role ${highestThreshold.roleId}: ${error.message}`));
+                            await outputChannel.send(`${member.user.tag} now has ${count} vouch${count === 1 ? '' : 'es'} and earned the <@&${highestThreshold.roleId}> role!`);
+                        }
+                    } else {
+                        for (const role of ROLE_TIER_DATA) {
+                            if (member.roles.cache.has(role.roleId)) {
+                                await member.roles.remove(role.roleId).catch(error => logError(`Failed to remove role ${role.roleId}: ${error.message}`));
+                                await new Promise(resolve => setTimeout(resolve, 500));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        saveVouchData(vouchCounts);
+        console.log(`Processed explicit @mentions in search channel ${searchChannel.id}, updated vouch counts and roles for ${targetUserId ? `user ${targetUserId}` : 'all server members'}.`);
+        await outputChannel.send('Vouch counts and roles have been updated based on explicit @mentions in the vouch channel.');
+    } catch (error) {
+        logError(`Failed to process mentions in search channel ${searchChannel?.id || 'unknown'}: ${error.message}`);
+        const errorMessage = error.message.includes('Bot lacks the following permissions')
+            ? error.message
+            : `There was an issue searching for vouches: ${error.message}. Check bot permissions, channel access, or ensure the channel name/ID is correct.`;
+        await outputChannel?.send(errorMessage);
+        if (commandChannel) {
+            await commandChannel.send(`An error occurred while processing vouches. Check the output in <#${OUTPUT_CHANNEL_ID}> for details or see logs: ${error.message}`);
+        }
+    }
+}
+
+client.once('ready', async () => {
+    console.log('Vouch Bot is online!');
+    console.log(`Logged in as ${client.user.tag}`);
+    console.log(`Invite Link: https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=268435456&scope=bot`);
+    try {
+        const guild = client.guilds.cache.first();
+        if (!guild) {
+            throw new Error('No guild found. Ensure the bot is in a server.');
+        }
+
+        const searchChannel = await findChannel(guild, DEFAULT_VOUCH_CHANNEL_NAME);
+        const outputChannel = await getOutputChannel(guild);
+        if (outputChannel) {
+            await outputChannel.send('Vouch Bot is online and ready to track vouches based on explicit @mentions!');
+        } else {
+            console.log('No output channel available, skipping startup message.');
+        }
+
+        setTimeout(async () => {
+            try {
+                await processMentionsInChannel(searchChannel, guild);
+            } catch (error) {
+                logError(`Deferred processMentionsInChannel failed: ${error.message}`);
+                if (outputChannel) {
+                    await outputChannel.send(`Failed to process mentions on startup: ${error.message}. The bot is still running, but please check permissions or channel settings.`);
+                }
+            }
+        }, 5000);
+    } catch (error) {
+        logError(`Failed to send startup message: ${error.message}`);
+        console.log(`Error sending startup message: ${error.message}`);
+    }
+});
+
+client.on('messageCreate', async message => {
+    if (message.author.bot || !message.content.startsWith(PREFIX)) return;
+
+    const args = message.content.slice(PREFIX.length).trim().split(/ +/);
+    let command = args.shift()?.toLowerCase();
+    console.log(`Received command: ${command} from ${message.author.tag} in channel ${message.channel.id}`); // Fix 4: Debug logging
+
+    if (command === 'vouch' && args[0]?.toLowerCase() === 'search') {
+        const member = message.member;
+        if (!member || !member.roles.cache.has(OWNER_ROLE_ID)) {
+            return message.reply('Only the owner can use this command.');
+        }
+
+        try {
+            await message.channel.send('Processing /vouchsearch command...'); // Fix 3: Acknowledge command
+            const guild = message.guild;
+            if (!guild) throw new Error('Guild not found. Ensure the bot is in the correct server.');
+
+            console.log(`Received /vouchsearch command with args: ${args.join(', ')}`);
+
+            let channelMention = null;
+            let userMention = null;
+
+            const channelMatch = args.find(arg => arg.startsWith('<#') && arg.endsWith('>'));
+            if (channelMatch) channelMention = channelMatch;
+            else {
+                const channelName = args.find(arg => arg.startsWith('#'));
+                if (channelName) channelMention = channelName.replace(/^#/, '');
+            }
+
+            userMention = args.find(arg => arg.startsWith('<@') && (arg.endsWith('>') || arg.endsWith('>!')));
+            if (!userMention) {
+                const usernameMention = args.find(arg => arg.startsWith('@') && !arg.startsWith('<@'));
+                if (usernameMention) {
+                    const username = usernameMention.replace(/^@/, '').toLowerCase();
+                    const member = guild.members.cache.find(m => 
+                        m.user.username.toLowerCase() === username || 
+                        m.nickname?.toLowerCase() === username
+                    );
+                    if (member) userMention = `<@${member.user.id}>`;
+                }
+            }
+
+            if (!userMention) {
+                throw new Error('No user mentioned. Please mention a user with @mention.');
+            }
+
+            let searchChannel;
+            if (channelMention) searchChannel = await findChannel(guild, channelMention);
+            else searchChannel = await findChannel(guild, DEFAULT_VOUCH_CHANNEL_NAME);
+
+            const userIdMatch = userMention.match(/<@!?(\d+)>/);
+            if (!userIdMatch) {
+                throw new Error(`Invalid user mention format: ${userMention}`);
+            }
+
+            const targetUserId = userIdMatch[1];
+            const targetUser = await client.users.fetch(targetUserId).catch(error => {
+                throw new Error(`User ${userMention} not found: ${error.message}`);
+            });
+            if (!guild.members.cache.has(targetUserId)) {
+                throw new Error(`User ${userMention} is not a member of this server.`);
+            }
+
+            await processMentionsInChannel(searchChannel, guild, targetUserId, message.channel);
+            const targetMember = guild.members.cache.get(targetUserId);
+            await message.channel.send(`Vouch counts and roles for ${targetMember.user.tag} have been updated based on explicit @mentions in ${searchChannel.name}. Check <#${OUTPUT_CHANNEL_ID}> for details.`);
+        } catch (error) {
+            logError(`Failed to search vouches: ${error.message}`);
+            await message.reply(`There was an issue searching for vouches: ${error.message}. Check bot permissions, channel access, or ensure the channel/user is correct.`);
+        }
+        return;
+    }
+
+    if (command === 'vouch') {
+        const mentionedUser = message.mentions.users.first();
+        if (!mentionedUser) return message.reply('Please mention a user to vouch for with an @mention!');
+        if (mentionedUser.id === message.author.id) return message.reply('You can’t vouch for yourself!');
+
+        const count = (vouchCounts.get(mentionedUser.id) || 0) + 1;
+        vouchCounts.set(mentionedUser.id, count);
+        saveVouchData(vouchCounts);
+
+        try {
+            const member = message.guild.members.cache.get(mentionedUser.id);
+            if (!member) return message.reply('Couldn’t find that member in this server!');
+            const currentRoles = ROLE_TIER_DATA.map(t => t.roleId).filter(id => member.roles.cache.has(id));
+            const highestThreshold = ROLE_TIER_DATA.filter(t => count >= t.vouches).pop();
+
+            if (highestThreshold) {
+                for (const oldRoleId of currentRoles) {
+                    if (oldRoleId !== highestThreshold.roleId && member.roles.cache.has(oldRoleId)) {
+                        await member.roles.remove(oldRoleId).catch(error => logError(`Failed to remove role ${oldRoleId}: ${error.message}`));
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                    }
+                }
+                if (!member.roles.cache.has(highestThreshold.roleId)) {
+                    await member.roles.add(highestThreshold.roleId).catch(error => logError(`Failed to add role ${highestThreshold.roleId}: ${error.message}`));
+                    await message.channel.send(`${mentionedUser.tag} now has ${count} vouch${count === 1 ? '' : 'es'} and earned the <@&${highestThreshold.roleId}> role!`);
+                } else {
+                    await message.channel.send(`${mentionedUser.tag} now has ${count} vouch${count === 1 ? '' : 'es'}.`);
+                }
+            } else {
+                await message.channel.send(`${mentionedUser.tag} now has ${count} vouch${count === 1 ? '' : 'es'}.`);
+            }
+        } catch (error) {
+            logError(`Failed to update roles for ${mentionedUser.tag}: ${error.message}`);
+            await message.channel.send('There was an issue updating roles. Check bot permissions.');
+        }
+    }
+
+    if (command === 'vouches') {
+        const mentionedUser = message.mentions.users.first() || message.author;
+        const count = vouchCounts.get(mentionedUser.id) || 0;
+        try {
+            await message.reply(`${mentionedUser.tag} has ${count} vouch${count === 1 ? '' : 'es'}, based on explicit @mentions.`);
+        } catch (error) {
+            logError(`Failed to reply to vouches command for ${mentionedUser.tag}: ${error.message}`);
+            await message.channel.send('There was an issue replying to the vouches command. Check bot permissions.');
+        }
+    }
+
+    // Other commands (unvouch, vouchreset, vouchwipe) should also send responses to message.channel
+});
+
+client.on('error', error => logError(`Discord client error: ${error.message}`));
+
+client.login(process.env.DISCORD_TOKEN).catch(error => {
+    console.error('Failed to login. Please check your DISCORD_TOKEN.');
+    console.error('Error details:', error.message);
+    if (!process.env.DISCORD_TOKEN) logError('DISCORD_TOKEN is missing in environment variables.');
+});
