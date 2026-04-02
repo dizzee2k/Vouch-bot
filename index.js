@@ -507,7 +507,7 @@ client.once('ready', async () => {
 
         const outputChannel = await getOutputChannel(guild);
         if (outputChannel) {
-            await outputChannel.send('Vouch Bot is online and ready to track vouches based on explicit @mentions in #vouch! Use `/vouchsearch @user` to check vouches for a specific user.');
+            await outputChannel.send('Vouch Bot is online and ready to track vouches based on explicit @mentions in #vouch! Use `/vouches @user` to check vouches for a specific user.');
         } else {
             console.log('No output channel available, skipping startup message.');
         }
